@@ -206,7 +206,8 @@ _cargar_env()
 
 
 def cfg(nombre, defecto=""):
-    return os.environ.get(nombre, defecto)
+    # strip(): quita espacios o saltos de linea que se cuelan al pegar valores en Vercel
+    return (os.environ.get(nombre, defecto) or "").strip()
 
 
 DATABASE_URL = cfg("DATABASE_URL") or cfg("POSTGRES_URL")
@@ -497,8 +498,24 @@ def _smtp_conectar():
     else:
         s = smtplib.SMTP(host, port, timeout=20)
         s.starttls()
-    s.login(cfg("SMTP_USER"), cfg("SMTP_PASS"))
+    # Gmail muestra la contrasena de aplicacion con espacios; se quitan por si se pegaron.
+    s.login(cfg("SMTP_USER").strip(), cfg("SMTP_PASS").replace(" ", "").strip())
     return s
+
+
+def _explicar_error(e):
+    """Convierte un error de correo en un mensaje claro para mostrar en el panel."""
+    detalle = f"{type(e).__name__}: {e}"
+    if isinstance(e, smtplib.SMTPAuthenticationError):
+        return ("Gmail rechazó el usuario o la contraseña de aplicación "
+                "(revisa SMTP_USER y SMTP_PASS en Vercel). " + detalle)
+    if isinstance(e, smtplib.SMTPServerDisconnected):
+        return ("El servidor de correo cortó la conexión antes de enviar. " + detalle)
+    if isinstance(e, smtplib.SMTPSenderRefused):
+        return ("El servidor no aceptó el remitente (revisa FROM_EMAIL). " + detalle)
+    if isinstance(e, (TimeoutError, ConnectionError, OSError)):
+        return ("No se pudo conectar con el servidor de correo (revisa SMTP_HOST y SMTP_PORT). " + detalle)
+    return detalle
 
 
 def _a_mensaje(d):
@@ -554,10 +571,13 @@ class Enviador:
                     self.smtp.send_message(_a_mensaje(d))
                     enviado = True
                     break
-                except smtplib.SMTPServerDisconnected:
+                except smtplib.SMTPServerDisconnected as e:
+                    # El servidor cerro la conexion: se reintenta una vez, pero se guarda el motivo.
+                    error = _explicar_error(e)
                     self.smtp = None
                 except Exception as e:
-                    error = str(e)
+                    error = _explicar_error(e)
+                    self.smtp = None
                     break
             if enviado:
                 ok += 1
