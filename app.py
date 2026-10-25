@@ -16,7 +16,8 @@ Variables que se configuran en Vercel (Settings -> Environment Variables):
   OPCIONALES
     MARCA            nombre que sale en la pagina y en los correos (por defecto: La Abui)
     LECTURA_URL      tu pagina de venta (por defecto la de tu lectura)
-    RESEND_API_KEY   si prefieres Resend (necesita dominio propio) en vez de SMTP
+    BREVO_API_KEY    envio por internet con Brevo (recomendado en Vercel; gratis hasta 300/dia)
+    RESEND_API_KEY   si prefieres Resend (necesita dominio propio)
     REPLY_TO, TEST_EMAIL, BASE_URL, SECRET_KEY, WELCOME_EMAIL (1/0)
 
 EL TEXTO DEL TEST (preguntas y resultados) esta mas abajo, en la seccion "CONTENIDO DEL TEST".
@@ -42,7 +43,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
-from email.utils import formataddr
+from email.utils import formataddr, parseaddr
 from functools import wraps
 from urllib.parse import urlencode
 
@@ -406,6 +407,10 @@ def usa_resend():
     return bool(cfg("RESEND_API_KEY"))
 
 
+def usa_brevo():
+    return bool(cfg("BREVO_API_KEY")) and not usa_resend()
+
+
 def smtp_configurado():
     return all([cfg("SMTP_HOST"), cfg("SMTP_USER"), cfg("SMTP_PASS")])
 
@@ -413,7 +418,7 @@ def smtp_configurado():
 def correo_configurado():
     if not cfg("FROM_EMAIL"):
         return False
-    return usa_resend() or smtp_configurado()
+    return usa_resend() or usa_brevo() or smtp_configurado()
 
 
 def _enlazar(texto_escapado):
@@ -490,6 +495,43 @@ def _resend(ruta, carga):
         raise RuntimeError(f"Resend {e.code}: {e.read().decode(errors='ignore')[:240]}")
 
 
+def _brevo(d):
+    """Envia un correo con la API web de Brevo (HTTPS). Lanza RuntimeError con el motivo si falla."""
+    nombre_rem, correo_rem = parseaddr(d["from"])
+    carga = {
+        "sender": {"name": nombre_rem or MARCA, "email": correo_rem},
+        "to": [{"email": d["to"]}],
+        "subject": d["subject"],
+        "htmlContent": d["html"],
+        "textContent": d["text"],
+        "headers": d["headers"],
+    }
+    if d.get("reply_to"):
+        carga["replyTo"] = {"email": d["reply_to"]}
+    req = urllib.request.Request(
+        "https://api.brevo.com/v3/smtp/email",
+        data=json.dumps(carga).encode(),
+        headers={
+            "api-key": cfg("BREVO_API_KEY"),
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "app-correos/1.0",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        cuerpo = e.read().decode(errors="ignore")[:300]
+        if e.code in (401, 403):
+            raise RuntimeError("Brevo rechazo la clave o el remitente (revisa BREVO_API_KEY y que el remitente "
+                               f"este verificado en Brevo). Detalle {e.code}: {cuerpo}")
+        raise RuntimeError(f"Brevo {e.code}: {cuerpo}")
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"No se pudo conectar con Brevo: {e.reason}")
+
+
 def _smtp_conectar():
     host = cfg("SMTP_HOST")
     port = int(cfg("SMTP_PORT", "587"))
@@ -560,6 +602,16 @@ class Enviador:
                     fallidos += 1
                     error = str(e)
                 time.sleep(0.6)  # Resend permite ~2 peticiones por segundo
+            return ok, fallidos, error
+
+        if usa_brevo():
+            for d in mensajes:
+                try:
+                    _brevo(d)
+                    ok += 1
+                except Exception as e:
+                    fallidos += 1
+                    error = str(e)
             return ok, fallidos, error
 
         for d in mensajes:
@@ -1368,7 +1420,7 @@ TEMPLATES = {
 <h2 style="margin-top:14px">Escribir correo</h2>
 
 {% if not correo_ok %}
-<div class="aviso">El envío aún no está configurado. Mira el README (variables FROM_EMAIL y RESEND_API_KEY o SMTP).</div>
+<div class="aviso">El envío aún no está configurado. Mira el README (variables FROM_EMAIL y BREVO_API_KEY, o RESEND_API_KEY, o SMTP).</div>
 {% endif %}
 
 <form class="tarjeta" method="post" id="form">
