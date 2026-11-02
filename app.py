@@ -48,7 +48,7 @@ from functools import wraps
 from urllib.parse import urlencode
 
 from flask import (Flask, abort, flash, g, jsonify, redirect, render_template,
-                   request, session, url_for, Response)
+                   request, session, url_for, Response, make_response)
 
 from types import SimpleNamespace
 
@@ -320,6 +320,10 @@ ESQUEMA = [
         estado TEXT NOT NULL DEFAULT 'enviando',
         ultimo_error TEXT NOT NULL DEFAULT ''
     )""",
+    "CREATE TABLE IF NOT EXISTS envios (campana_id BIGINT NOT NULL, suscriptor_id BIGINT NOT NULL,"
+    " PRIMARY KEY (campana_id, suscriptor_id))",
+    "CREATE TABLE IF NOT EXISTS campana_excluye (campana_id BIGINT NOT NULL, otra_id BIGINT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS programadas (campana_id BIGINT PRIMARY KEY, cuando TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS limites (clave TEXT NOT NULL, ts BIGINT NOT NULL)",
     "CREATE INDEX IF NOT EXISTS limites_clave ON limites (clave)",
 ]
@@ -429,6 +433,18 @@ def _enlazar(texto_escapado):
     )
 
 
+# Logo del correo: pon LOGO_URL en Vercel, o pega el logo en LOGO_B64 (imagen en base64)
+LOGO_B64 = ""
+
+
+def url_logo():
+    if cfg("LOGO_URL"):
+        return cfg("LOGO_URL")
+    if LOGO_B64:
+        return f"{BASE_URL}/logo.png"
+    return ""
+
+
 def cuerpo_a_html(cuerpo, nombre, url_baja):
     cuerpo = cuerpo.replace("{nombre}", nombre or "")
     parrafos = [p.strip() for p in re.split(r"\n\s*\n", cuerpo.strip()) if p.strip()]
@@ -440,13 +456,19 @@ def cuerpo_a_html(cuerpo, nombre, url_baja):
         )
     contenido = "\n".join(partes)
     marca = html.escape(MARCA)
+    logo = url_logo()
+    if logo:
+        encabezado = (f'<img src="{html.escape(logo)}" alt="{marca}" width="120" '
+                      f'style="display:block;margin:0 auto;max-width:120px;height:auto;border:0">')
+    else:
+        encabezado = f'<span style="font-size:20px;letter-spacing:.5px;color:#f4e3b8">{marca}</span>'
     return f"""<!doctype html>
 <html lang="es"><body style="margin:0;padding:0;background:#f3eef8">
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f3eef8;padding:24px 12px">
 <tr><td align="center">
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;background:#ffffff;border-radius:14px;overflow:hidden;font-family:Georgia,'Times New Roman',serif">
-<tr><td style="background:#2a1a4a;padding:22px 28px;border-bottom:3px solid #d4a24c">
-<span style="font-size:20px;letter-spacing:.5px;color:#f4e3b8">{marca}</span></td></tr>
+<tr><td align="center" style="background:#2a1a4a;padding:22px 28px;border-bottom:3px solid #d4a24c">
+{encabezado}</td></tr>
 <tr><td style="padding:28px 28px 12px">{contenido}</td></tr>
 <tr><td style="padding:8px 28px 26px;font-family:Arial,sans-serif;font-size:12px;line-height:1.6;color:#7b7390">
 Recibes este correo porque te uniste a la lista de {marca}.<br>
@@ -577,27 +599,31 @@ class Enviador:
 
     def __init__(self):
         self.smtp = None
+        self.exitosos = []  # posiciones (en la lista del ultimo lote) que si se enviaron
 
     def lote(self, mensajes):
         """mensajes: lista de dicts de armar(). Devuelve (ok, fallidos, ultimo_error)."""
         ok = fallidos = 0
         error = ""
+        self.exitosos = []
         if usa_resend():
             try:
                 if len(mensajes) == 1:
                     _resend("/emails", mensajes[0])
                 else:
                     _resend("/emails/batch", mensajes)
+                self.exitosos = list(range(len(mensajes)))
                 return len(mensajes), 0, ""
             except Exception as e:
                 error = str(e)
                 if len(mensajes) == 1:
                     return 0, 1, error
             # Si el lote falla, probamos uno por uno para aislar el correo malo.
-            for d in mensajes:
+            for i, d in enumerate(mensajes):
                 try:
                     _resend("/emails", d)
                     ok += 1
+                    self.exitosos.append(i)
                 except Exception as e:
                     fallidos += 1
                     error = str(e)
@@ -605,16 +631,29 @@ class Enviador:
             return ok, fallidos, error
 
         if usa_brevo():
-            for d in mensajes:
+            def uno(par):
                 try:
-                    _brevo(d)
-                    ok += 1
+                    _brevo(par[1])
+                    return par[0], ""
                 except Exception as e:
+                    return par[0], str(e) or "error"
+
+            if len(mensajes) == 1:
+                resultados = [uno((0, mensajes[0]))]
+            else:
+                from concurrent.futures import ThreadPoolExecutor
+                with ThreadPoolExecutor(max_workers=5) as ex:
+                    resultados = list(ex.map(uno, enumerate(mensajes)))
+            for i, err in resultados:
+                if err:
                     fallidos += 1
-                    error = str(e)
+                    error = err
+                else:
+                    ok += 1
+                    self.exitosos.append(i)
             return ok, fallidos, error
 
-        for d in mensajes:
+        for i, d in enumerate(mensajes):
             enviado = False
             for _ in range(2):
                 try:
@@ -633,6 +672,7 @@ class Enviador:
                     break
             if enviado:
                 ok += 1
+                self.exitosos.append(i)
             else:
                 fallidos += 1
         return ok, fallidos, error
@@ -699,6 +739,17 @@ def guardar_suscriptor(db, email, nombre, origen, resultado=""):
 # --------------------------------------------------------------------------
 # Rutas publicas
 # --------------------------------------------------------------------------
+@app.route("/logo.png")
+def logo_png():
+    import base64
+    if not LOGO_B64:
+        abort(404)
+    resp = make_response(base64.b64decode(LOGO_B64))
+    resp.headers["Content-Type"] = "image/png"
+    resp.headers["Cache-Control"] = "public, max-age=86400"
+    return resp
+
+
 @app.get("/")
 def inicio():
     return render_template("inicio.html", origen=limpiar_origen(request.args.get("o")))
@@ -848,7 +899,9 @@ def admin():
     db = get_db()
     q = request.args.get("q", "").strip().lower()
     filtro = request.args.get("estado", "activo")
-    sql = "SELECT * FROM suscriptores WHERE 1=1"
+    sql = ("SELECT s.*, (SELECT c.asunto FROM envios e JOIN campanas c ON c.id=e.campana_id"
+           " WHERE e.suscriptor_id=s.id ORDER BY e.campana_id DESC LIMIT 1) AS ultimo"
+           " FROM suscriptores s WHERE 1=1")
     params = []
     if filtro in ("activo", "baja"):
         sql += " AND estado=?"
@@ -908,6 +961,46 @@ def eliminar(sid):
     return redirect(request.referrer or url_for("admin"))
 
 
+def excluidas_de(db, cid):
+    filas = db.execute("SELECT otra_id FROM campana_excluye WHERE campana_id=?", (cid,)).fetchall()
+    return [f["otra_id"] for f in filas]
+
+
+def filtro_destinatarios(db, segmento, excluir_ids):
+    """Trozo de SQL (para agregar a ... WHERE estado='activo') con el grupo y las exclusiones."""
+    sql, params = "", []
+    if segmento:
+        sql += " AND resultado=?"
+        params.append(segmento)
+    for xid in excluir_ids:
+        x = db.execute("SELECT * FROM campanas WHERE id=?", (xid,)).fetchone()
+        if x is None:
+            continue
+        hay = db.execute("SELECT 1 AS u FROM envios WHERE campana_id=? LIMIT 1", (xid,)).fetchone()
+        if hay:
+            sql += " AND id NOT IN (SELECT suscriptor_id FROM envios WHERE campana_id=?)"
+            params.append(xid)
+        else:
+            # Envios anteriores a esta funcion: no hay lista exacta, se calcula por grupo y orden.
+            sql += " AND NOT (id <= ? AND (CAST(? AS TEXT) = '' OR resultado = CAST(? AS TEXT)))"
+            params += [x["ultimo_id"], x["segmento"], x["segmento"]]
+    return sql, params
+
+
+def contar_destinatarios(db, segmento, excluir_ids):
+    extra, p = filtro_destinatarios(db, segmento, excluir_ids)
+    return db.execute(
+        "SELECT COUNT(*) AS n FROM suscriptores WHERE estado='activo'" + extra, p
+    ).fetchone()["n"]
+
+
+def campanas_previas(db):
+    return db.execute(
+        "SELECT id, asunto, segmento, creado, enviados, total FROM campanas"
+        " WHERE estado NOT IN ('programada','cancelada') ORDER BY id DESC LIMIT 12"
+    ).fetchall()
+
+
 def contar_segmentos(db):
     filas = db.execute(
         "SELECT resultado AS r, COUNT(*) AS n FROM suscriptores WHERE estado='activo' GROUP BY resultado"
@@ -926,7 +1019,8 @@ def contar_segmentos(db):
 def enviar():
     db = get_db()
     segs = contar_segmentos(db)
-    contexto = dict(segs=segs, asunto="", cuerpo="", segmento="")
+    contexto = dict(segs=segs, asunto="", cuerpo="", segmento="",
+                    previas=campanas_previas(db), excluir=[])
     if request.method == "GET":
         return render_template("enviar.html", **contexto)
 
@@ -936,7 +1030,12 @@ def enviar():
     accion = request.form.get("accion", "")
     if segmento not in [s[0] for s in segs]:
         segmento = ""
-    contexto.update(asunto=asunto, cuerpo=cuerpo, segmento=segmento)
+    validas = {p["id"] for p in contexto["previas"]}
+    excluir = []
+    for v in request.form.getlist("excluir"):
+        if v.isdigit() and int(v) in validas and int(v) not in excluir:
+            excluir.append(int(v))
+    contexto.update(asunto=asunto, cuerpo=cuerpo, segmento=segmento, excluir=excluir)
 
     if not correo_configurado():
         flash("Falta configurar el envío de correos (mira el README).")
@@ -954,10 +1053,37 @@ def enviar():
             flash(f"No se pudo enviar la prueba: {e}")
         return render_template("enviar.html", **contexto)
 
+    if accion == "programar":
+        if not cfg("CRON_SECRET"):
+            flash("Para programar falta la variable CRON_SECRET en Vercel (mira las instrucciones).")
+            return render_template("enviar.html", **contexto)
+        try:
+            dia = datetime.strptime(request.form.get("fecha", ""), "%Y-%m-%d")
+        except ValueError:
+            flash("Elige el día en que quieres que se envíe.")
+            return render_template("enviar.html", **contexto)
+        cuando = dia.strftime("%Y-%m-%d") + " " + HORA_ENVIO_UTC
+        if cuando <= ahora():
+            flash("Ese día ya pasó (los envíos salen a las 7 p. m.). Elige hoy antes de esa hora, o un día futuro.")
+            return render_template("enviar.html", **contexto)
+        total = contar_destinatarios(db, segmento, excluir)
+        cur = db.execute(
+            "INSERT INTO campanas (asunto, cuerpo, segmento, creado, total, max_id, estado)"
+            " VALUES (?,?,?,?,?,?,'programada') RETURNING id",
+            (asunto, cuerpo, segmento, ahora(), total, 0),
+        )
+        cid = cur.fetchone()["id"]
+        db.execute("INSERT INTO programadas (campana_id, cuando) VALUES (?,?)", (cid, cuando))
+        for xid in excluir:
+            db.execute("INSERT INTO campana_excluye (campana_id, otra_id) VALUES (?,?)", (cid, xid))
+        db.commit()
+        flash(f"Programado para el {dia.strftime('%d/%m/%Y')} a las 7 p. m. (hora de República Dominicana).")
+        return redirect(url_for("ver_campana", cid=cid))
+
     if accion == "todos":
-        total = next(n for clave, _etq, n in segs if clave == segmento)
+        total = contar_destinatarios(db, segmento, excluir)
         if total == 0:
-            flash("No hay contactos activos en ese grupo todavía.")
+            flash("No hay contactos para enviar: nadie en ese grupo, o todos ya lo recibieron.")
             return render_template("enviar.html", **contexto)
         max_id = db.execute("SELECT COALESCE(MAX(id),0) AS m FROM suscriptores").fetchone()["m"]
         cur = db.execute(
@@ -966,6 +1092,8 @@ def enviar():
             (asunto, cuerpo, segmento, ahora(), total, max_id),
         )
         cid = cur.fetchone()["id"]
+        for xid in excluir:
+            db.execute("INSERT INTO campana_excluye (campana_id, otra_id) VALUES (?,?)", (cid, xid))
         db.commit()
         return redirect(url_for("ver_campana", cid=cid))
     abort(400)
@@ -985,7 +1113,9 @@ def _estado_json(c):
 @app.get("/admin/campana/<int:cid>")
 @requiere_admin
 def ver_campana(cid):
-    return render_template("campana.html", c=_campana(get_db(), cid))
+    db = get_db()
+    p = db.execute("SELECT cuando FROM programadas WHERE campana_id=?", (cid,)).fetchone()
+    return render_template("campana.html", c=_campana(db, cid), fecha=(p["cuando"][:10] if p else ""))
 
 
 @app.post("/admin/campana/<int:cid>/estado")
@@ -993,7 +1123,10 @@ def ver_campana(cid):
 def cambiar_estado_campana(cid):
     db = get_db()
     nuevo = request.form.get("estado")
-    if nuevo in ("pausada", "enviando"):
+    if nuevo == "cancelada":
+        db.execute("UPDATE campanas SET estado='cancelada' WHERE id=? AND estado='programada'", (cid,))
+        db.commit()
+    elif nuevo in ("pausada", "enviando"):
         db.execute(
             "UPDATE campanas SET estado=? WHERE id=? AND estado IN ('pausada','enviando','error')",
             (nuevo, cid),
@@ -1006,14 +1139,17 @@ def cambiar_estado_campana(cid):
 @requiere_admin
 def tanda_campana(cid):
     """Envia unos cuantos correos y devuelve el progreso. El navegador la llama en bucle."""
-    db = get_db()
+    return jsonify(procesar_tanda(get_db(), cid, float(cfg("TANDA_SEGUNDOS", "7"))))
+
+
+def procesar_tanda(db, cid, presupuesto):
     c = _campana(db, cid)
     if c["estado"] != "enviando":
-        return jsonify(_estado_json(c))
+        return _estado_json(c)
 
     inicio = time.time()
-    presupuesto = float(cfg("TANDA_SEGUNDOS", "7"))
-    tam = int(cfg("TAMANO_LOTE", "25")) if usa_resend() else 1
+    tam = (int(cfg("TAMANO_LOTE", "25")) if usa_resend()
+           else int(cfg("TAMANO_LOTE", "8")) if usa_brevo() else 1)
     env = Enviador()
     fallos_seguidos = 0
     ocupado = False
@@ -1021,9 +1157,9 @@ def tanda_campana(cid):
         while time.time() - inicio < presupuesto:
             sql = "SELECT id, email, nombre, token FROM suscriptores WHERE estado='activo' AND id>? AND id<=?"
             params = [c["ultimo_id"], c["max_id"]]
-            if c["segmento"]:
-                sql += " AND resultado=?"
-                params.append(c["segmento"])
+            extra, extra_p = filtro_destinatarios(db, c["segmento"], excluidas_de(db, cid))
+            sql += extra
+            params += extra_p
             sql += " ORDER BY id LIMIT ?"
             params.append(tam)
             lote = db.execute(sql, params).fetchall()
@@ -1044,6 +1180,11 @@ def tanda_campana(cid):
             ok, fallidos, error = env.lote(
                 [armar(c["asunto"], c["cuerpo"], s["email"], s["nombre"], s["token"]) for s in lote]
             )
+            for i in env.exitosos:
+                db.execute(
+                    "INSERT INTO envios (campana_id, suscriptor_id) VALUES (?,?) ON CONFLICT DO NOTHING",
+                    (cid, lote[i]["id"]),
+                )
             db.execute(
                 "UPDATE campanas SET enviados=enviados+?, fallidos=fallidos+?,"
                 " ultimo_error=CASE WHEN CAST(? AS TEXT)<>'' THEN CAST(? AS TEXT) ELSE ultimo_error END WHERE id=?",
@@ -1060,7 +1201,60 @@ def tanda_campana(cid):
         env.cerrar()
     datos = _estado_json(_campana(db, cid))
     datos["ocupado"] = ocupado
-    return jsonify(datos)
+    return datos
+
+
+HORA_ENVIO_UTC = "23:00:00"  # 7:00 p. m. en Republica Dominicana (UTC-4)
+
+
+@app.get("/cron/enviar")
+def cron_enviar():
+    """Lo llama Vercel Cron cada dia: arranca los envios programados y continua los que esten en curso."""
+    secreto = cfg("CRON_SECRET")
+    recibido = request.headers.get("Authorization", "")
+    if not secreto or not hmac.compare_digest(recibido, f"Bearer {secreto}"):
+        abort(401)
+    db = get_db()
+    if not correo_configurado():
+        return jsonify(error="correo no configurado")
+
+    # 1) Arrancar los programados cuya hora ya llego (se calcula el grupo en este momento).
+    iniciados = []
+    vencidas = db.execute(
+        "SELECT c.id FROM campanas c JOIN programadas p ON p.campana_id=c.id"
+        " WHERE c.estado='programada' AND p.cuando<=? ORDER BY c.id", (ahora(),)
+    ).fetchall()
+    for v in vencidas:
+        cid = v["id"]
+        c = _campana(db, cid)
+        total = contar_destinatarios(db, c["segmento"], excluidas_de(db, cid))
+        max_id = db.execute("SELECT COALESCE(MAX(id),0) AS m FROM suscriptores").fetchone()["m"]
+        nuevo = "enviando" if total else "terminada"
+        cur = db.execute(
+            "UPDATE campanas SET estado=?, total=?, max_id=?, ultimo_id=0 WHERE id=? AND estado='programada'",
+            (nuevo, total, max_id, cid),
+        )
+        db.commit()
+        if cur.rowcount == 1:
+            iniciados.append(cid)
+
+    # 2) Enviar lo que este en curso, dentro del tiempo disponible.
+    inicio = time.time()
+    limite = float(cfg("CRON_SEGUNDOS", "45"))
+    pendientes = [r["id"] for r in db.execute(
+        "SELECT id FROM campanas WHERE estado='enviando' ORDER BY id").fetchall()]
+    while pendientes and time.time() - inicio < limite:
+        for cid in list(pendientes):
+            resto = limite - (time.time() - inicio)
+            if resto <= 1:
+                break
+            d = procesar_tanda(db, cid, min(7.0, resto))
+            if d["estado"] != "enviando":
+                pendientes.remove(cid)
+            elif d.get("ocupado"):
+                time.sleep(1)
+    resumen = [dict(_estado_json(_campana(db, cid))) for cid in set(iniciados) | set(pendientes)]
+    return jsonify(iniciados=iniciados, campanas=resumen)
 
 
 
@@ -1215,7 +1409,7 @@ TEMPLATES = {
         <div style="font-weight:500">{{ c['asunto'] }}</div>
         <div class="suave" style="font-size:13px">
           {{ c['creado'] }} UTC ·
-          {{ {'enviando':'En curso','terminada':'Terminada','error':'Se detuvo con error','pausada':'En pausa'}[c['estado']] }} ·
+          {{ {'enviando':'En curso','terminada':'Terminada','error':'Se detuvo con error','pausada':'En pausa','programada':'Programado','cancelada':'Cancelado'}[c['estado']] }} ·
           {{ c['enviados'] }}/{{ c['total'] }}{% if c['fallidos'] %} · {{ c['fallidos'] }} fallidos{% endif %}
         </div>
         <div class="progreso"><i style="width:{{ (100 * c['enviados'] / c['total'])|round|int if c['total'] else 0 }}%"></i></div>
@@ -1259,7 +1453,7 @@ TEMPLATES = {
   </form>
   <div class="tabla-wrap">
     <table>
-      <thead><tr><th>Correo</th><th>Nombre</th><th>Resultado</th><th>Origen</th><th>Registro</th><th></th></tr></thead>
+      <thead><tr><th>Correo</th><th>Nombre</th><th>Resultado</th><th>Origen</th><th>Registro</th><th>Último correo</th><th></th></tr></thead>
       <tbody>
       {% for s in lista %}
         <tr>
@@ -1268,6 +1462,7 @@ TEMPLATES = {
           <td>{{ nombres[s['resultado']]['nombre'] if s['resultado'] in nombres else '—' }}</td>
           <td>{{ s['origen'] or 'directo' }}</td>
           <td>{{ s['creado'][:10] }}</td>
+          <td class="libre">{{ s['ultimo'][:30] if s['ultimo'] else '—' }}</td>
           <td>
             <form method="post" action="{{ url_for('eliminar', sid=s['id']) }}" onsubmit="return confirm('¿Eliminar este contacto para siempre?')">
               <input type="hidden" name="csrf" value="{{ csrf_token() }}">
@@ -1276,7 +1471,7 @@ TEMPLATES = {
           </td>
         </tr>
       {% else %}
-        <tr><td colspan="6" class="suave">No hay contactos con ese filtro.</td></tr>
+        <tr><td colspan="7" class="suave">No hay contactos con ese filtro.</td></tr>
       {% endfor %}
       </tbody>
     </table>
@@ -1376,6 +1571,11 @@ TEMPLATES = {
     <input type="hidden" name="estado" value="enviando">
     <button class="btn" type="submit">Continuar envío</button>
   </form>
+  <form method="post" action="{{ url_for('cambiar_estado_campana', cid=c['id']) }}" id="f-cancelar" style="display:none" onsubmit="return confirm('¿Cancelar este envío programado?')">
+    <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+    <input type="hidden" name="estado" value="cancelada">
+    <button class="btn peligro" type="submit">Cancelar envío programado</button>
+  </form>
 </div>
 
 <script>
@@ -1384,10 +1584,22 @@ TEMPLATES = {
   var CSRF = {{ csrf_token()|tojson }};
   var textos = {
     enviando: 'Enviando…', terminada: '✅ Envío terminado', pausada: '⏸ Envío en pausa',
-    error: '⚠️ El envío se detuvo'
+    error: '⚠️ El envío se detuvo', programada: '🗓 Programado', cancelada: 'Envío cancelado'
   };
+  var FECHA = {{ fecha|tojson }};
   function pintar() {
     document.getElementById('estado').textContent = textos[datos.estado] || datos.estado;
+    document.getElementById('f-cancelar').style.display = datos.estado === 'programada' ? 'block' : 'none';
+    if (datos.estado === 'programada') {
+      document.getElementById('cuenta').textContent = 'Se enviará el ' + FECHA.split('-').reverse().join('/') + ' a las 7 p. m. (hora RD), a unas ' + datos.total + ' personas.';
+      document.getElementById('fallos').textContent = '';
+      document.getElementById('barra').style.width = '0%';
+      document.getElementById('error').textContent = '';
+      document.getElementById('f-pausar').style.display = 'none';
+      document.getElementById('f-seguir').style.display = 'none';
+      document.getElementById('nota').textContent = 'No necesitas dejar nada abierto. Se enviará solo.';
+      return;
+    }
     document.getElementById('cuenta').textContent = datos.enviados + ' de ' + datos.total + ' enviados';
     document.getElementById('fallos').textContent = datos.fallidos ? ' · ' + datos.fallidos + ' fallidos' : '';
     document.getElementById('barra').style.width = (datos.total ? Math.round(100 * datos.enviados / datos.total) : 0) + '%';
@@ -1435,6 +1647,18 @@ TEMPLATES = {
   <input id="asunto" name="asunto" type="text" maxlength="150" value="{{ asunto }}" placeholder="Ej: {nombre}, tengo un mensaje para ti" required>
   <label for="cuerpo">Mensaje</label>
   <textarea id="cuerpo" name="cuerpo" placeholder="Hola {nombre},&#10;&#10;Escribe aquí tu mensaje. Deja una línea en blanco para separar párrafos.&#10;&#10;Con cariño,&#10;La Abui" required>{{ cuerpo }}</textarea>
+  {% if previas %}
+  <label style="margin-top:14px">No enviar a quienes ya recibieron (opcional)</label>
+  <div style="display:flex;flex-direction:column;gap:8px;margin-top:6px">
+    {% for p in previas %}
+    <label style="display:flex;gap:10px;align-items:flex-start;font-size:14.5px;margin:0;font-weight:400">
+      <input type="checkbox" name="excluir" value="{{ p['id'] }}" style="width:auto;margin-top:3px" {{ 'checked' if p['id'] in excluir }}>
+      <span>{{ p['asunto'][:46] }}<br><span class="suave" style="font-size:12.5px">{{ p['creado'][:10] }} · {{ p['enviados'] }} enviados{% if p['segmento'] %} · {{ p['segmento'] }}{% endif %}</span></span>
+    </label>
+    {% endfor %}
+  </div>
+  <p class="legal">Marca el envío anterior para saltarte a quienes ya lo recibieron. Sirve para continuar al día siguiente, o para llegar a los que entraron después.</p>
+  {% endif %}
   <p class="legal">Escribe <b>{nombre}</b> y se cambia por el nombre de cada persona. El enlace para darse de baja se agrega solo al final. Los links (https://…) se vuelven clicables.</p>
 
   <div class="fila" style="margin-top:6px">
@@ -1442,13 +1666,22 @@ TEMPLATES = {
     <button class="btn" type="submit" name="accion" value="todos" id="btn-todos">Enviar ahora</button>
   </div>
   <p class="legal">Siempre manda primero la prueba para ver cómo se ve en tu correo.</p>
+
+  <label for="fecha" style="margin-top:18px">…o programarlo para otro día (se envía solo a las 7 p. m., hora de República Dominicana)</label>
+  <input id="fecha" name="fecha" type="date">
+  <div class="fila" style="margin-top:10px">
+    <button class="btn sec" type="submit" name="accion" value="programar">Programar envío</button>
+  </div>
+  <p class="legal">No tienes que dejar nada abierto. Al llegar la hora, el grupo se calcula en ese momento, así que entran las personas que se hayan unido antes.</p>
 </form>
 
 <script>
 document.getElementById('btn-todos').addEventListener('click', function (e) {
   var sel = document.getElementById('segmento');
   var etiqueta = sel.options[sel.selectedIndex].text;
-  if (!confirm('¿Enviar este correo a: ' + etiqueta + '? No se puede deshacer.')) e.preventDefault();
+  var saltar = document.querySelectorAll('input[name=excluir]:checked').length;
+  var nota = saltar ? ' (sin quienes ya recibieron lo que marcaste)' : '';
+  if (!confirm('¿Enviar este correo a: ' + etiqueta + nota + '? No se puede deshacer.')) e.preventDefault();
 });
 </script>
 {% endblock %}

@@ -1,0 +1,7 @@
+{
+  "crons": [
+    { "path": "/cron/enviar", "schedule": "0 23 * * *" },
+    { "path": "/cron/enviar", "schedule": "0 0 * * *" },
+    { "path": "/cron/enviar", "schedule": "0 1 * * *" }
+  ]
+}
