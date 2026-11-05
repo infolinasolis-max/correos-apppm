@@ -324,6 +324,9 @@ ESQUEMA = [
     " PRIMARY KEY (campana_id, suscriptor_id))",
     "CREATE TABLE IF NOT EXISTS campana_excluye (campana_id BIGINT NOT NULL, otra_id BIGINT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS programadas (campana_id BIGINT PRIMARY KEY, cuando TEXT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS secuencia_envios (suscriptor_id BIGINT NOT NULL, paso INTEGER NOT NULL,"
+    " enviado TEXT NOT NULL, PRIMARY KEY (suscriptor_id, paso))",
+    "CREATE TABLE IF NOT EXISTS ajustes (clave TEXT PRIMARY KEY, valor TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS limites (clave TEXT NOT NULL, ts BIGINT NOT NULL)",
     "CREATE INDEX IF NOT EXISTS limites_clave ON limites (clave)",
 ]
@@ -338,6 +341,12 @@ def init_db():
             for sentencia in ESQUEMA:
                 db.execute(sentencia)
             db.commit()
+            try:  # columna nueva para saber cuando se envio cada correo (limite diario)
+                db.execute("ALTER TABLE envios ADD COLUMN IF NOT EXISTS ts TEXT" if USA_PG
+                           else "ALTER TABLE envios ADD COLUMN ts TEXT")
+                db.commit()
+            except Exception:
+                pass
             _listo = True
             return
         except Exception:
@@ -928,9 +937,18 @@ def admin():
         " WHERE estado='activo' AND resultado<>'' GROUP BY resultado ORDER BY n DESC"
     ).fetchall()
     campanas = db.execute("SELECT * FROM campanas ORDER BY id DESC LIMIT 8").fetchall()
+    por_paso = {f["paso"]: f["n"] for f in db.execute(
+        "SELECT paso, COUNT(*) AS n FROM secuencia_envios GROUP BY paso").fetchall()}
+    pasos = []
+    for i, p in enumerate(SECUENCIA, start=1):
+        a = p["asunto"]["" ] if isinstance(p["asunto"], dict) else p["asunto"]
+        pasos.append({"dias": p["dias"], "asunto": a.replace("{nombre}", "…"), "enviados": por_paso.get(i, 0)})
+    sec = {"activa": secuencia_activa(db), "pasos": pasos,
+           "pendientes": len(pendientes_secuencia(db, 10 ** 6)),
+           "tope": int(cfg("SECUENCIA_MAX_DIA", "200"))}
     return render_template(
         "admin.html", lista=lista, stats=stats, origenes=origenes, resultados=resultados,
-        campanas=campanas, q=q, filtro=filtro, nombres=quiz.RESULTADOS,
+        campanas=campanas, q=q, filtro=filtro, nombres=quiz.RESULTADOS, sec=sec,
     )
 
 
@@ -1182,8 +1200,8 @@ def procesar_tanda(db, cid, presupuesto):
             )
             for i in env.exitosos:
                 db.execute(
-                    "INSERT INTO envios (campana_id, suscriptor_id) VALUES (?,?) ON CONFLICT DO NOTHING",
-                    (cid, lote[i]["id"]),
+                    "INSERT INTO envios (campana_id, suscriptor_id, ts) VALUES (?,?,?) ON CONFLICT DO NOTHING",
+                    (cid, lote[i]["id"], ahora()),
                 )
             db.execute(
                 "UPDATE campanas SET enviados=enviados+?, fallidos=fallidos+?,"
@@ -1254,7 +1272,234 @@ def cron_enviar():
             elif d.get("ocupado"):
                 time.sleep(1)
     resumen = [dict(_estado_json(_campana(db, cid))) for cid in set(iniciados) | set(pendientes)]
-    return jsonify(iniciados=iniciados, campanas=resumen)
+    sec = correr_secuencia(db, limite - (time.time() - inicio))
+    return jsonify(iniciados=iniciados, campanas=resumen, secuencia=sec)
+
+
+
+# ==========================================================================
+# SECUENCIA AUTOMATICA (correos de valor que se envian solos a cada persona)
+# ==========================================================================
+# "dias" = a cuantos dias de haberse unido le toca ese correo. Se puede cambiar todo aqui.
+# Puedes usar {nombre} y, en el ultimo, {enlace} (tu pagina de la lectura con seguimiento).
+SECUENCIA = [
+    {
+        "dias": 2,
+        "asunto": "{nombre}, un ritual de 3 minutos para esta noche 🌙",
+        "cuerpo": (
+            "Hola {nombre},\n\n"
+            "Hoy quiero regalarte algo sencillo.\n\n"
+            "Esta noche, antes de dormir:\n\n"
+            "1. Apaga las pantallas 5 minutos antes.\n"
+            "2. Escribe en un papel una cosa por la que estás agradecida hoy, aunque sea pequeña.\n"
+            "3. Escribe una cosa que quieres soltar.\n"
+            "4. Respira profundo tres veces y di en voz baja: «Hoy me permito descansar.»\n\n"
+            "Parece poco, pero lo que repites cada noche se vuelve tu forma de pensar.\n\n"
+            "Cuéntame por aquí si lo hiciste. Me encanta leerte.\n\n"
+            "Con cariño,\nLa Abui"
+        ),
+    },
+    {
+        "dias": 4,
+        "asunto": "Tu frase para esta semana ✨",
+        "cuerpo": (
+            "Hola {nombre},\n\n"
+            "Te dejo una frase para repetir en voz alta cada mañana:\n\n"
+            "«Lo que es para mí no necesita que me desgaste para alcanzarlo.»\n\n"
+            "Úsala cuando sientas prisa, comparación o miedo a quedarte atrás. "
+            "Respira y repítela tres veces.\n\n"
+            "Puedes guardarla en una nota o ponerla de fondo de pantalla.\n\n"
+            "Con cariño,\nLa Abui"
+        ),
+    },
+    {
+        "dias": 7,
+        "asunto": "{nombre}, quiero saber de ti 💛",
+        "cuerpo": (
+            "Hola {nombre},\n\n"
+            "Quiero conocerte un poco más. Respóndeme este correo con una sola frase:\n\n"
+            "¿Qué es lo que más quisieras cambiar en tu vida hoy?\n\n"
+            "Leo los mensajes que llegan, y con lo que me cuentes preparo los próximos temas.\n\n"
+            "Con cariño,\nLa Abui"
+        ),
+    },
+    {
+        "dias": 10,
+        "asunto": {
+            "dinero": "{nombre}, si lo que más te pesa es el dinero",
+            "amor": "{nombre}, si lo que más te pesa es el amor",
+            "paz": "{nombre}, si lo que más necesitas es paz",
+            "": "{nombre}, si hoy necesitas una guía",
+        },
+        "cuerpo": {
+            "dinero": (
+                "Hola {nombre},\n\n"
+                "En estos días compartí contigo un ritual, una frase y una pregunta. Si algo te movió, qué bien.\n\n"
+                "Tu test mostró un bloqueo de abundancia. Si quieres ir más profundo y que alguien mire tu caso, "
+                "y no uno general, existe la Lectura Energética: una lectura hecha para ti, donde vemos qué te frena "
+                "con el dinero y cuál es tu siguiente paso.\n\n"
+                "Sin presión. Aquí queda el enlace por si lo necesitas:\n\n{enlace}\n\n"
+                "Y si no es el momento, sigue con los rituales. Todo suma.\n\n"
+                "Con cariño,\nLa Abui"
+            ),
+            "amor": (
+                "Hola {nombre},\n\n"
+                "En estos días compartí contigo un ritual, una frase y una pregunta. Si algo te movió, qué bien.\n\n"
+                "Tu test mostró un bloqueo del corazón. Si quieres ir más profundo y que alguien mire tu caso, "
+                "y no uno general, existe la Lectura Energética: una lectura hecha para ti, donde vemos qué te frena "
+                "en el amor y cuál es tu siguiente paso.\n\n"
+                "Sin presión. Aquí queda el enlace por si lo necesitas:\n\n{enlace}\n\n"
+                "Y si no es el momento, sigue con los rituales. Todo suma.\n\n"
+                "Con cariño,\nLa Abui"
+            ),
+            "paz": (
+                "Hola {nombre},\n\n"
+                "En estos días compartí contigo un ritual, una frase y una pregunta. Si algo te movió, qué bien.\n\n"
+                "Tu test mostró un bloqueo de paz interior. Si quieres ir más profundo y que alguien mire tu caso, "
+                "y no uno general, existe la Lectura Energética: una lectura hecha para ti, donde vemos qué te quita "
+                "la calma y cuál es tu siguiente paso.\n\n"
+                "Sin presión. Aquí queda el enlace por si lo necesitas:\n\n{enlace}\n\n"
+                "Y si no es el momento, sigue con los rituales. Todo suma.\n\n"
+                "Con cariño,\nLa Abui"
+            ),
+            "": (
+                "Hola {nombre},\n\n"
+                "En estos días compartí contigo un ritual, una frase y una pregunta. Si algo te movió, qué bien.\n\n"
+                "Si quieres ir más profundo y que alguien mire tu caso, y no uno general, existe la Lectura "
+                "Energética: una lectura hecha para ti, donde vemos qué te está frenando y cuál es tu siguiente paso.\n\n"
+                "Sin presión. Aquí queda el enlace por si lo necesitas:\n\n{enlace}\n\n"
+                "Y si no es el momento, sigue con los rituales. Todo suma.\n\n"
+                "Con cariño,\nLa Abui"
+            ),
+        },
+    },
+]
+
+FORMATO_FECHA = "%Y-%m-%d %H:%M:%S"
+
+
+def contenido_paso(paso, resultado):
+    p = SECUENCIA[paso - 1]
+    clave = resultado if resultado in ("amor", "dinero", "paz") else ""
+    asunto, cuerpo = p["asunto"], p["cuerpo"]
+    if isinstance(asunto, dict):
+        asunto = asunto.get(clave) or asunto[""]
+    if isinstance(cuerpo, dict):
+        cuerpo = cuerpo.get(clave) or cuerpo[""]
+    sep = "&" if "?" in LECTURA_URL else "?"
+    enlace = LECTURA_URL + sep + urlencode(
+        {"utm_source": "correo", "utm_campaign": "secuencia_" + (clave or "general")})
+    return asunto, cuerpo.replace("{enlace}", enlace)
+
+
+def ajuste(db, clave, defecto=""):
+    f = db.execute("SELECT valor FROM ajustes WHERE clave=?", (clave,)).fetchone()
+    return f["valor"] if f else defecto
+
+
+def poner_ajuste(db, clave, valor):
+    db.execute(
+        "INSERT INTO ajustes (clave, valor) VALUES (?,?)"
+        " ON CONFLICT (clave) DO UPDATE SET valor=excluded.valor", (clave, valor))
+    db.commit()
+
+
+def secuencia_activa(db):
+    return ajuste(db, "secuencia_activa", "0") == "1"
+
+
+def _fecha(texto):
+    return datetime.strptime(texto[:19], FORMATO_FECHA).replace(tzinfo=timezone.utc)
+
+
+def enviados_recientes(db, horas=18):
+    """Correos masivos enviados en las ultimas horas (campanas + secuencia): para no pasar el tope diario."""
+    corte = (datetime.now(timezone.utc) - timedelta(hours=horas)).strftime(FORMATO_FECHA)
+    a = db.execute("SELECT COUNT(*) AS n FROM envios WHERE ts>=?", (corte,)).fetchone()["n"]
+    b = db.execute("SELECT COUNT(*) AS n FROM secuencia_envios WHERE enviado>=?", (corte,)).fetchone()["n"]
+    return a + b
+
+
+def pendientes_secuencia(db, maximo):
+    """Personas a las que ya les toca su siguiente correo (las que se unieron hace poco, primero)."""
+    ahora_dt = datetime.now(timezone.utc)
+    espacio = timedelta(days=int(cfg("SECUENCIA_ESPACIO_DIAS", "3")))
+    filas = db.execute(
+        "SELECT s.id, s.email, s.nombre, s.token, s.resultado, s.creado,"
+        " COALESCE((SELECT MAX(q.paso) FROM secuencia_envios q WHERE q.suscriptor_id=s.id),0) AS ultimo_paso,"
+        " (SELECT MAX(q.enviado) FROM secuencia_envios q WHERE q.suscriptor_id=s.id) AS ultimo_envio"
+        " FROM suscriptores s WHERE s.estado='activo' ORDER BY s.id"
+    ).fetchall()
+    toca = []
+    for f in filas:
+        paso = int(f["ultimo_paso"]) + 1
+        if paso > len(SECUENCIA):
+            continue
+        if ahora_dt - _fecha(f["creado"]) < timedelta(days=SECUENCIA[paso - 1]["dias"]):
+            continue
+        if f["ultimo_envio"] and ahora_dt - _fecha(f["ultimo_envio"]) < espacio:
+            continue
+        toca.append((f["creado"], f, paso))
+    toca.sort(key=lambda t: t[0], reverse=True)
+    return [(f, p) for _c, f, p in toca[:maximo]]
+
+
+def correr_secuencia(db, limite_seg):
+    """La llama el cron: envia los correos de la secuencia que ya tocan, respetando el tope diario."""
+    if not secuencia_activa(db):
+        return {"activa": False, "enviados": 0}
+    tope = int(cfg("SECUENCIA_MAX_DIA", "200"))
+    cupo = tope - enviados_recientes(db)
+    if cupo <= 0 or limite_seg < 2:
+        return {"activa": True, "enviados": 0, "cupo": max(cupo, 0)}
+    lista = pendientes_secuencia(db, cupo)
+    tam = (int(cfg("TAMANO_LOTE", "25")) if usa_resend()
+           else int(cfg("TAMANO_LOTE", "8")) if usa_brevo() else 1)
+    inicio = time.time()
+    env = Enviador()
+    enviados = fallos_seguidos = 0
+    try:
+        for i in range(0, len(lista), tam):
+            if time.time() - inicio >= limite_seg:
+                break
+            reservados = []
+            for f, paso in lista[i:i + tam]:
+                # Reservar antes de enviar: si dos ejecuciones coinciden, no se duplica.
+                cur = db.execute(
+                    "INSERT INTO secuencia_envios (suscriptor_id, paso, enviado) VALUES (?,?,?)"
+                    " ON CONFLICT DO NOTHING", (f["id"], paso, ahora()))
+                if cur.rowcount == 1:
+                    reservados.append((f, paso))
+            db.commit()
+            if not reservados:
+                continue
+            mensajes = []
+            for f, paso in reservados:
+                asunto, cuerpo = contenido_paso(paso, f["resultado"])
+                mensajes.append(armar(asunto, cuerpo, f["email"], f["nombre"], f["token"]))
+            ok, fallidos, _error = env.lote(mensajes)
+            for j, (f, paso) in enumerate(reservados):
+                if j not in env.exitosos:  # no salio: se libera para intentarlo en la proxima ejecucion
+                    db.execute("DELETE FROM secuencia_envios WHERE suscriptor_id=? AND paso=?", (f["id"], paso))
+            db.commit()
+            enviados += ok
+            fallos_seguidos = fallos_seguidos + fallidos if ok == 0 else 0
+            if fallos_seguidos >= 3:  # limite diario o clave mala: parar
+                break
+    finally:
+        env.cerrar()
+    return {"activa": True, "enviados": enviados, "cupo": cupo}
+
+
+@app.post("/admin/secuencia")
+@requiere_admin
+def secuencia_ajuste():
+    db = get_db()
+    accion = request.form.get("accion")
+    if accion in ("on", "off"):
+        poner_ajuste(db, "secuencia_activa", "1" if accion == "on" else "0")
+        flash("Secuencia automática activada." if accion == "on" else "Secuencia automática en pausa.")
+    return redirect(url_for("admin"))
 
 
 
@@ -1398,6 +1643,21 @@ TEMPLATES = {
 <div class="fila" style="margin-top:18px">
   <a class="btn" style="margin-top:0" href="{{ url_for('enviar') }}">✉️ Escribir y enviar correo</a>
   <a class="btn sec" style="margin-top:0" href="{{ url_for('exportar') }}">Descargar lista (CSV)</a>
+</div>
+
+<div class="tarjeta" style="margin-top:18px" id="secuencia">
+  <h3 style="font-size:19px">Secuencia automática · {{ '🟢 activa' if sec['activa'] else '⏸ en pausa' }}</h3>
+  <p class="suave" style="font-size:14.5px;margin:6px 0 10px">Cada persona recibe estos correos sola, a los días de haberse unido. La app los manda a las 7 p. m. y nunca pasa de {{ sec['tope'] }} al día (para no pasarse del límite de Brevo).</p>
+  <table>
+    {% for p in sec['pasos'] %}<tr><td>Día {{ p['dias'] }}</td><td class="libre">{{ p['asunto'] }}</td><td style="text-align:right">{{ p['enviados'] }} enviados</td></tr>{% endfor %}
+  </table>
+  <p class="legal">En espera de recibir su siguiente correo: <b>{{ sec['pendientes'] }}</b> personas.</p>
+  <form method="post" action="{{ url_for('secuencia_ajuste') }}"
+        {% if not sec['activa'] %}onsubmit="return confirm('¿Activar? Desde esta noche se empezará a enviar solo, unos {{ sec['tope'] }} al día.')"{% endif %}>
+    <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+    <input type="hidden" name="accion" value="{{ 'off' if sec['activa'] else 'on' }}">
+    <button class="btn {{ 'sec' if sec['activa'] else '' }}" type="submit">{{ 'Pausar secuencia' if sec['activa'] else 'Activar secuencia' }}</button>
+  </form>
 </div>
 
 <div class="grid2">
